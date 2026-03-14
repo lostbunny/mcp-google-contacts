@@ -4,7 +4,7 @@ setup(
     name="mcp-google-contacts-server",
     version="0.1.0",  # This will be replaced by the workflow based on the tag
     description="MCP server for Google Contacts integration",
-    long_description=open("README.md").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="Rayan Zaki",
     author_email="rayan.hassici@ensia.edu.dz",
