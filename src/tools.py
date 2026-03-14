@@ -15,9 +15,12 @@ from formatters import (
     format_group_membership_result,
 )
 from google_contacts_service import GoogleContactsError, GoogleContactsService
+from credential_manager import CredentialManager
 
 # Global service instance
 contacts_service = None
+# Optional credential manager (set before init_service() is called)
+_cred_manager: "CredentialManager | None" = None
 
 
 def init_service() -> Optional[GoogleContactsService]:
@@ -32,7 +35,16 @@ def init_service() -> Optional[GoogleContactsService]:
         return contacts_service
 
     try:
-        # First try environment variables
+        # Try credential manager first (e.g. 1Password)
+        if _cred_manager is not None:
+            try:
+                contacts_service = GoogleContactsService.from_cred_manager(_cred_manager)
+                print("Successfully loaded credentials from credential manager.")
+                return contacts_service
+            except GoogleContactsError as e:
+                print(f"Credential manager failed: {e}")
+
+        # Then try environment variables
         try:
             contacts_service = GoogleContactsService.from_env()
             print("Successfully loaded credentials from environment variables.")
