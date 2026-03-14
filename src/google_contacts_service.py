@@ -12,6 +12,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from config import config
+from credential_manager import CredentialManager
 
 
 class GoogleContactsError(Exception):
@@ -53,16 +54,21 @@ class GoogleContactsService:
     ]
 
     def __init__(
-        self, credentials_info: Optional[Dict[str, Any]] = None, token_path: Optional[Path] = None
+        self,
+        credentials_info: Optional[Dict[str, Any]] = None,
+        token_path: Optional[Path] = None,
+        cred_manager: Optional[CredentialManager] = None,
     ):
         """Initialize the Google Contacts service with credentials info.
 
         Args:
             credentials_info: OAuth client credentials information
-            token_path: Path to store the token file
+            token_path: Path to store the token file (unused when cred_manager is set)
+            cred_manager: Optional credential manager for reading/writing the refresh token
         """
         self.credentials_info = credentials_info
         self.token_path = token_path or config.token_path
+        self.cred_manager = cred_manager
         self.service = self._authenticate()
 
     @classmethod
@@ -128,6 +134,50 @@ class GoogleContactsService:
 
         return cls(credentials_info, token_path)
 
+    @classmethod
+    def from_cred_manager(
+        cls,
+        cred_manager: CredentialManager,
+        token_path: Optional[Path] = None,
+    ) -> "GoogleContactsService":
+        """Create service instance using a pluggable credential manager.
+
+        Reads client_id and client_secret via the credential manager.
+        The refresh token is also read (and written after re-auth) via the
+        credential manager instead of token.json.
+
+        Args:
+            cred_manager: A CredentialManager implementation (e.g. OnePasswordCredentialManager)
+            token_path:   Ignored — token is stored in the credential manager, not on disk.
+                          Accepted for API consistency only.
+
+        Returns:
+            Configured GoogleContactsService instance
+
+        Raises:
+            GoogleContactsError: If client_id or client_secret cannot be retrieved
+        """
+        client_id = cred_manager.get("client_id")
+        client_secret = cred_manager.get("client_secret")
+
+        if not client_id or not client_secret:
+            raise GoogleContactsError(
+                "Credential manager could not supply client_id and/or client_secret."
+            )
+
+        credentials_info = {
+            "installed": {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"],
+            }
+        }
+
+        return cls(credentials_info, token_path, cred_manager=cred_manager)
+
     def _authenticate(self):
         """Authenticate with Google using credentials info.
 
@@ -141,34 +191,51 @@ class GoogleContactsService:
             creds = None
             token_path = self.token_path
 
-            # Ensure token directory exists
-            token_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.cred_manager:
+                # Load refresh token from credential manager (no file I/O)
+                refresh_token = self.cred_manager.get("refresh_token")
+                if refresh_token and self.credentials_info:
+                    client_id = self.credentials_info["installed"]["client_id"]
+                    client_secret = self.credentials_info["installed"]["client_secret"]
+                    creds = Credentials(
+                        None,
+                        refresh_token=refresh_token,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        scopes=config.scopes,
+                    )
+            else:
+                # Ensure token directory exists
+                token_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Check if we have existing token
-            if token_path.exists():
-                with open(token_path, "r") as token_file:
-                    creds = Credentials.from_authorized_user_info(
-                        json.load(token_file), config.scopes
+                # Check if we have existing token file
+                if token_path.exists():
+                    with open(token_path, "r") as token_file:
+                        creds = Credentials.from_authorized_user_info(
+                            json.load(token_file), config.scopes
+                        )
+
+                # Check for refresh token in environment
+                refresh_token = (
+                    os.environ.get("GOOGLE_REFRESH_TOKEN") or config.google_refresh_token
+                )
+                if not creds and refresh_token and self.credentials_info:
+                    client_id = self.credentials_info["installed"]["client_id"]
+                    client_secret = self.credentials_info["installed"]["client_secret"]
+                    creds = Credentials(
+                        None,
+                        refresh_token=refresh_token,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        scopes=config.scopes,
                     )
 
-            # Check for refresh token in environment
-            refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN") or config.google_refresh_token
-            if not creds and refresh_token and self.credentials_info:
-                client_id = self.credentials_info["installed"]["client_id"]
-                client_secret = self.credentials_info["installed"]["client_secret"]
-
-                creds = Credentials(
-                    None,  # No access token initially
-                    refresh_token=refresh_token,
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    scopes=config.scopes,
-                )
-
-            # If credentials don't exist or are invalid, go through auth flow
+            # If credentials don't exist or are invalid, refresh when possible before
+            # falling back to the interactive browser flow.
             if not creds or not creds.valid:
-                if creds and creds.expired and creds.refresh_token:
+                if creds and creds.refresh_token:
                     creds.refresh(Request())
                 else:
                     if not self.credentials_info:
@@ -179,16 +246,20 @@ class GoogleContactsService:
                     flow = InstalledAppFlow.from_client_config(self.credentials_info, config.scopes)
                     creds = flow.run_local_server(port=0)
 
-                # Save the credentials for future use
-                with open(token_path, "w") as token:
-                    token.write(creds.to_json())
+                # Persist the new/refreshed token
+                if self.cred_manager:
+                    if creds.refresh_token:
+                        self.cred_manager.set("refresh_token", creds.refresh_token)
+                        print("Refresh token saved to credential manager.")
+                else:
+                    with open(token_path, "w") as token:
+                        token.write(creds.to_json())
 
-                # Output refresh token for environment variable setup
-                if creds.refresh_token:
-                    print(
-                        "\nNew refresh token obtained. Consider setting this in your environment:"
-                    )
-                    print(f"GOOGLE_REFRESH_TOKEN={creds.refresh_token}\n")
+                    if creds.refresh_token:
+                        print(
+                            "\nNew refresh token obtained. Consider setting this in your environment:"
+                        )
+                        print(f"GOOGLE_REFRESH_TOKEN={creds.refresh_token}\n")
 
             # Build and return the Google Contacts service
             return build("people", "v1", credentials=creds)
